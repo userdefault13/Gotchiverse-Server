@@ -27,9 +27,10 @@ from ascii_map.roads import get_district_road_rects  # noqa: E402
 # Unity paints one 16px tile per on-chain coordinate unit (humble = 8×8 tiles).
 UNITY_TILE_UNIT = 1
 
-# Gotchiverse humble autotile IDs (see humble.aseprite / Rule Tile 1–9):
-#   5=interior  4=N  3=E  1=S  2=W  9=NW  6=NE  8=SW  7=SE
-# Tile 0 = earth (world ground). Internal parcel_border_index → gotchiverse digit.
+# Gotchiverse parcel autotile IDs (see *.aseprite sheets, tiles numbered 1–9):
+#   5 = interior fill   4 = N   3 = E   1 = S   2 = W   9 = NW   6 = NE   8 = SW   7 = SE
+# Tile 0 = earth (world ground). Border index → game_id via PARCEL_BORDER_TO_GOTCHI.
+PARCEL_INTERIOR_GAME_ID = 5
 PARCEL_BORDER_TO_GOTCHI = {
     0: "5",
     1: "4",
@@ -57,9 +58,25 @@ PARCEL_SHEET_TILE = {
 
 EARTH_CHAR = "0"
 ROAD_SYMBOLS = list("!@#$%^&*(")
-REASONABLE_SYMBOLS = list("ijklmnopq")
-SPACIOUS_SYMBOLS = list("rstuvwxyz")
-PAARTNER_SYMBOLS = list("ABCDEFGHI")
+HUMBLE_SYMBOLS = [str(i) for i in range(1, 10)]
+# Parcel PNGs export in game_id order 1..9 (S,W,E,N,interior,NE,SE,SW,NW) — same as humble
+# digits 1-9. Paint maps border index → game_id via PARCEL_BORDER_TO_GOTCHI, then picks the
+# symbol at game_id - 1 in these lists (not border-index order).
+REASONABLE_SYMBOLS = list("lmkjioqpn")
+SPACIOUS_SYMBOLS = list("uvtsrxzyw")
+PAARTNER_SYMBOLS = list("DECBAGIHF")
+PARCEL_SYMBOLS_BY_TYPE = {
+    "humble": HUMBLE_SYMBOLS,
+    "reasonable": REASONABLE_SYMBOLS,
+    "spacious": SPACIOUS_SYMBOLS,
+    "paartner": PAARTNER_SYMBOLS,
+}
+ALL_PARCEL_PAINTED_SYMBOLS = frozenset(
+    HUMBLE_SYMBOLS
+    + REASONABLE_SYMBOLS
+    + SPACIOUS_SYMBOLS
+    + PAARTNER_SYMBOLS
+)
 
 TRAIL_FILES = {
     0: "trail0_1.png",
@@ -102,8 +119,25 @@ def counts_as_road_for_trail_autotile(ch: str | None) -> bool:
     """Parcel neighbors are not trail edges — use trail_0 along parcel sides."""
     if ch is None:
         return False
+    if ch in ROAD_SYMBOLS or ch in ALL_PARCEL_PAINTED_SYMBOLS:
+        return True
     cat = category_for_char(ch)
     return cat == "road" or cat in PARCEL_TYPES
+
+
+def parcel_interior_symbol(parcel_type: str) -> str:
+    """Interior fill — always game_id 5 (plain tile, no border edges) for every parcel type."""
+    symbols = PARCEL_SYMBOLS_BY_TYPE.get(parcel_type, HUMBLE_SYMBOLS)
+    return symbols[PARCEL_INTERIOR_GAME_ID - 1]
+
+
+def parcel_border_symbol(parcel_type: str, border_idx: int) -> str:
+    """Map parcel border index to the painted ASCII symbol (via gotchiverse game_id 1-9)."""
+    if border_idx == 0:
+        return parcel_interior_symbol(parcel_type)
+    game_id = int(PARCEL_BORDER_TO_GOTCHI[border_idx])
+    symbols = PARCEL_SYMBOLS_BY_TYPE.get(parcel_type, HUMBLE_SYMBOLS)
+    return symbols[game_id - 1]
 
 
 def road_autotile_index(
@@ -335,9 +369,27 @@ def build_unity_tile_layers(data: DistrictData):
     })()
 
 
+def trail_neighbor_char(
+    painted: list[list[str]],
+    layers,
+    x: int,
+    y: int,
+    dx: int,
+    dy: int,
+    width: int,
+    height: int,
+) -> str | None:
+    nx, ny = x + dx, y + dy
+    if nx < 0 or ny < 0 or nx >= width or ny >= height:
+        return None
+    ch = painted[ny][nx]
+    if ch != EMPTY_CHAR:
+        return ch
+    return layers.chars[ny][nx]
+
+
 def paint_unity_map(data: DistrictData, layers) -> list[list[str]]:
     """Paint parcel borders at full footprint size, then autotile roads."""
-    symbols = build_symbol_lookup()
     width, height = layers.width, layers.height
     painted = [[EMPTY_CHAR for _ in range(width)] for _ in range(height)]
 
@@ -368,21 +420,18 @@ def paint_unity_map(data: DistrictData, layers) -> list[list[str]]:
             for local_x in range(tw):
                 gx, gy = tx0 + local_x, ty0 + local_y
                 idx = parcel_border_index(local_x, local_y, tw, th)
-                if ptype == "humble":
-                    painted[gy][gx] = PARCEL_BORDER_TO_GOTCHI[idx]
-                else:
-                    painted[gy][gx] = symbols[(ptype, idx)]
+                painted[gy][gx] = parcel_border_symbol(ptype, idx)
 
     for y in range(height):
         for x in range(width):
             if layers.chars[y][x] != ROAD_CHAR:
                 continue
-            north = layers.chars[y - 1][x] if y > 0 else None
-            south = layers.chars[y + 1][x] if y + 1 < height else None
-            west = layers.chars[y][x - 1] if x > 0 else None
-            east = layers.chars[y][x + 1] if x + 1 < width else None
+            north = trail_neighbor_char(painted, layers, x, y, 0, -1, width, height)
+            south = trail_neighbor_char(painted, layers, x, y, 0, 1, width, height)
+            west = trail_neighbor_char(painted, layers, x, y, -1, 0, width, height)
+            east = trail_neighbor_char(painted, layers, x, y, 1, 0, width, height)
             idx = road_autotile_index(north, east, south, west)
-            painted[y][x] = symbols[("road", idx)]
+            painted[y][x] = ROAD_SYMBOLS[idx]
 
     for y in range(height):
         for x in range(width):
@@ -392,21 +441,10 @@ def paint_unity_map(data: DistrictData, layers) -> list[list[str]]:
     return painted
 
 
-def build_symbol_lookup() -> dict[tuple[str, int], str]:
-    lookup: dict[tuple[str, int], str] = {}
-    for idx in range(9):
-        lookup[("road", idx)] = ROAD_SYMBOLS[idx]
-    for idx in range(9):
-        lookup[("reasonable", idx)] = REASONABLE_SYMBOLS[idx]
-        lookup[("spacious", idx)] = SPACIOUS_SYMBOLS[idx]
-        lookup[("paartner", idx)] = PAARTNER_SYMBOLS[idx]
-    return lookup
-
-
 def symbol_order_text() -> str:
     """One ASCII symbol per exported tile PNG (tile_0000 …)."""
     lines: list[str] = [EARTH_CHAR]
-    lines.extend(str(d) for d in range(1, 10))
+    lines.extend(HUMBLE_SYMBOLS)
     lines.extend(ROAD_SYMBOLS)
     lines.extend(REASONABLE_SYMBOLS)
     lines.extend(SPACIOUS_SYMBOLS)
